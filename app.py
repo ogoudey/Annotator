@@ -19,6 +19,8 @@ import dataset as ds
 import lerobot_io
 from store import ProjectStore, dataset_key, timeline_summary, to_csv_rows
 
+import auto_annotate
+
 # Bumped whenever the shape of an /api response changes. The frontend checks
 # it so a stale server process reports version skew instead of throwing a
 # TypeError deep in the client. Static files are re-read from disk per request,
@@ -396,6 +398,65 @@ def api_import_lerobot() -> Response:
 @app.errorhandler(404)
 def json_errors(err: Any) -> tuple[Response, int]:
     return jsonify({"error": getattr(err, "description", str(err))}), getattr(err, "code", 500)
+
+
+
+@app.post("/api/auto-annotate")
+def api_auto_annotate() -> Response:
+    """Start an auto-annotation job and return its id straight away.
+
+    The model call takes a while, so this is a job + poll pair rather than one
+    long request: a blocking request would sit past proxy timeouts and give the
+    UI nothing to show in the meantime.
+    """
+    body = request.get_json(silent=True) or {}
+    root = _safe_root(body.get("root"))
+    view = body.get("view")
+    layer_ids = [str(x) for x in (body.get("layer_ids") or [])]
+    if not layer_ids:
+        abort(400, "Pick at least one layer to annotate")
+
+    try:
+        start = float(body["start"])
+        end = float(body["end"])
+    except (KeyError, TypeError, ValueError):
+        abort(400, "start and end are required")
+    if end - start < 1e-3:
+        abort(400, "That range is empty")
+
+    timeline = ds.build_timeline(root, cache_for(root))
+    available = timeline["views"]
+    if not available:
+        abort(404, f"No videos found under {root}/videos")
+    # `views` is the list; `view` stays accepted so an older client still works.
+    wanted = [v for v in (body.get("views") or ([view] if view else [])) if v in available]
+    if not wanted:
+        wanted = [next(iter(available))]
+
+    job = auto_annotate.start({
+        "root": str(root),
+        "views": wanted,
+        "segments_by_view": {v: available[v]["segments"] for v in wanted},
+        "start": start,
+        "end": end,
+        "fps": timeline["fps"],
+        "layer_ids": layer_ids,
+        "layer_instructions": body.get("layer_instructions") or {},
+        "context_layer_id": body.get("context_layer_id") or None,
+        "context_annotations": body.get("context_annotations") or [],
+        "notes": body.get("notes") or None,
+        "accurate": body.get("accurate", True),
+    })
+    return jsonify({"api": API_VERSION, **job.to_dict()})
+
+
+ 
+@app.get("/api/auto-annotate/<job_id>")
+def api_auto_annotate_status(job_id: str) -> Response:
+    job = auto_annotate.get_job(job_id)
+    if job is None:
+        abort(404, "No such job (it may have expired)")
+    return jsonify({"api": API_VERSION, **job.to_dict()})
 
 
 # --------------------------------------------------------------------------

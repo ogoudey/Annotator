@@ -19,10 +19,21 @@ const state = {
 // Must match API_VERSION in app.py. See checkApi() for why this exists.
 const API_VERSION = 2;
 
-const PALETTE = ['#6EA8FF', '#7ED9A7', '#E2A0FF', '#F2B45C', '#7FD6E8', '#FF9BA8', '#B9CE6A', '#C3A1F0'];
+/** Throws instead of returning null: a missing id means the template and this
+ *  script are out of step, and "can't access property textContent of null" a
+ *  few frames later tells you nothing about which one. */
+const $ = (id) => {
+  const node = document.getElementById(id);
+  if (!node) {
+    throw new Error(
+      `No element with id "${id}". templates/index.html is out of step with app.js `
+      + '(restart the server so Jinja re-reads the template, and hard-reload the page).');
+  }
+  return node;
+};
 
-
-const $ = (id) => document.getElementById(id);
+/** For ids that are only present some of the time. */
+const $opt = (id) => document.getElementById(id);
 const player = new MultiView($('views'));
 
 const timeline = new Timeline({
@@ -39,8 +50,9 @@ const timeline = new Timeline({
   onSelectClip: (clip, layer, focusEditor) => renderInspector(clip, layer, focusEditor),
   onSelectionChange: () => refreshCreateButton(),
   onClipPreview: (clip) => updateInspectorTimes(clip),
-  onEditClip: () => { const ta = $('clip-text'); if (ta) { ta.focus(); ta.select(); } },
+  onEditClip: () => { const ta = $opt('clip-text'); if (ta) { ta.focus(); ta.select(); } },
   onAddStyle: (name, layer) => addStyle(name, layer),
+  onAutoAnnotate: (sel) => openAutoAnnotate(sel),
 });
 
 /* ---------------- saving ---------------- */
@@ -73,7 +85,7 @@ async function saveNow() {
     setSaveState('idle');
   } catch (err) {
     setSaveState('error', err.message);
-    U.toast(`Could not save: ${err.message}`, true);
+    U.fail(err, 'Could not save');
   }
 }
 
@@ -141,7 +153,7 @@ async function openSession(root, scope = 'dataset', chunk = 0, file = 0) {
     U.toast(`${session.dataset.name}: ${plan.length} view(s), ${files} file(s), ${U.dur(tl.duration)}`);
     for (const w of (tl.warnings || [])) U.toast(w, true);
   } catch (err) {
-    U.toast(err.message, true);
+    U.fail(err, 'Opening session');
   }
 }
 
@@ -282,8 +294,8 @@ function renderInspector(clip, layer, focusEditor) {
 
 function updateInspectorTimes(clip) {
   if (!clip || timeline.selectedClipId !== clip.id) return;
-  const s = $('clip-start');
-  const e = $('clip-end');
+  const s = $opt('clip-start');
+  const e = $opt('clip-end');
   if (s) s.value = clip.start.toFixed(3);
   if (e) e.value = clip.end.toFixed(3);
 }
@@ -345,11 +357,396 @@ function renderStats() {
 
 function addStyle(name, layer) {
   const p = state.project;
-  const style = { id: U.uid('st'), name, color: PALETTE[p.styles.length % PALETTE.length] };
+  const palette = ['#6EA8FF', '#7ED9A7', '#E2A0FF', '#F2B45C', '#7FD6E8', '#FF9BA8', '#B9CE6A', '#C3A1F0'];
+  const style = { id: U.uid('st'), name, color: palette[p.styles.length % palette.length] };
   p.styles.push(style);
   if (layer) layer.style_id = style.id;
   timeline.onChange('add-style');
   timeline.render();
+}
+
+/* ---------------- LeRobot write-back / import ---------------- */
+
+const PALETTE = ['#6EA8FF', '#7ED9A7', '#E2A0FF', '#F2B45C', '#7FD6E8', '#FF9BA8', '#B9CE6A', '#C3A1F0'];
+
+function ensureStyle(name) {
+  const p = state.project;
+  let style = p.styles.find((s) => s.name === name);
+  if (!style) {
+    style = { id: U.uid('st'), name, color: PALETTE[p.styles.length % PALETTE.length] };
+    p.styles.push(style);
+  }
+  return style;
+}
+
+function figure(value, label) {
+  return U.el('div', { class: 'figure' }, [U.el('b', { text: String(value) }), U.el('span', { text: label })]);
+}
+
+/** Generic preview + confirm. onConfirm null => informational only. */
+function showReport(title, nodes, confirmLabel, onConfirm, note = '') {
+  $('report-title').textContent = title;
+  const body = $('report-body');
+  body.innerHTML = '';
+  for (const n of nodes) if (n) body.appendChild(n);
+  $('report-note').textContent = note;
+  const btn = $('report-confirm');
+  btn.hidden = !onConfirm;
+  btn.textContent = confirmLabel || 'Confirm';
+  btn.onclick = onConfirm || null;
+  openModal('report-modal');
+}
+
+function warnBlock(warnings) {
+  if (!warnings || !warnings.length) return null;
+  return U.el('div', {}, warnings.map((w) => U.el('div', { class: 'warn', text: w })));
+}
+
+function exportPayload(extra) {
+  return JSON.stringify({
+    root: state.root, scope: state.scope, chunk: state.chunk, file: state.file, ...extra,
+  });
+}
+
+async function exportToLeRobot() {
+  if (!state.root) { U.toast('Open a dataset first'); return; }
+  saveSoon.flush();
+  try {
+    const plan = await U.api('/api/export/lerobot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: exportPayload({ dry_run: true }),
+    });
+    renderExportPlan(plan);
+  } catch (err) {
+    U.fail(err, 'Export preview');
+  }
+}
+
+function renderExportPlan(plan) {
+  const styleRows = Object.entries(plan.styles || {})
+    .map(([from, to]) => U.el('li', { class: 'mono', text: from === to ? from : `${from} → ${to}` }));
+
+  const nodes = [
+    U.el('div', { class: 'figures' }, [
+      figure(plan.rows, 'rows to write'),
+      figure(`${plan.episodes_annotated}/${plan.episodes_total}`, 'episodes annotated'),
+      figure(plan.episodes_cleared, 'episodes cleared'),
+    ]),
+    U.el('h3', { text: 'Styles' }),
+    U.el('ul', {}, styleRows),
+    plan.skipped && plan.skipped.length
+      ? U.el('div', {}, [
+        U.el('h3', { text: `Skipped (${plan.skipped.length})` }),
+        U.el('ul', {}, plan.skipped.slice(0, 8).map((s) => U.el('li', { text: `${s.clip}: ${s.reason}` }))),
+      ])
+      : null,
+    warnBlock(plan.warnings),
+  ];
+
+  const canWrite = plan.ok && plan.rows > 0;
+  showReport(
+    'Write into dataset',
+    nodes,
+    'Write to parquet',
+    canWrite ? () => applyExport() : null,
+    canWrite ? 'Rewrites data/*.parquet in place. A copy of data/ is saved first.' : 'Nothing to write.',
+  );
+}
+
+async function applyExport() {
+  const btn = $('report-confirm');
+  btn.disabled = true;
+  btn.textContent = 'Writing…';
+  try {
+    const done = await U.api('/api/export/lerobot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: exportPayload({ dry_run: false, backup: true, spans: true }),
+    });
+    showReport('Written', [
+      U.el('div', { class: 'figures' }, [
+        figure(done.rows, 'rows written'),
+        figure(done.episodes_annotated, 'episodes'),
+        figure((done.written || []).length, 'shards rewritten'),
+      ]),
+      U.el('h3', { text: 'Files' }),
+      U.el('ul', {}, (done.written || []).map((w) => U.el('li', { class: 'mono', text: w }))),
+      done.backup ? U.el('p', { class: 'mono muted', text: `backup: ${done.backup}` }) : null,
+      warnBlock(done.warnings),
+    ], null, null, done.validator || '');
+    U.toast(`Wrote ${done.rows} language_persistent row(s)`);
+  } catch (err) {
+    U.fail(err, 'Writing to the dataset');
+    closeModal('report-modal');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Write to parquet';
+  }
+}
+
+async function importFromLeRobot() {
+  if (!state.root) { U.toast('Open a dataset first'); return; }
+  try {
+    const q = `root=${encodeURIComponent(state.root)}&scope=${state.scope}&chunk=${state.chunk}&file=${state.file}`;
+    const found = await U.api(`/api/import/lerobot?${q}`);
+    const nodes = [
+      U.el('div', { class: 'figures' }, [
+        figure(found.clips, 'segments'),
+        figure(found.styles.length, 'styles'),
+        figure(found.episodes, 'episodes'),
+      ]),
+      U.el('h3', { text: 'Styles found' }),
+      U.el('ul', {}, found.styles.map((s) => U.el('li', {
+        class: 'mono', text: `${s} — ${found.clips_by_style[s].length} segment(s)`,
+      }))),
+      found.exact_ends === found.clips && found.clips
+        ? U.el('p', { class: 'muted', text: 'Every segment carries an exact end_timestamp, so '
+          + 'starts and ends come back as they were written.' })
+        : U.el('div', { class: 'warn', text: 'Some rows have no end_timestamp. Those segments end '
+          + 'where the next annotation of the same style begins, or at the end of their episode.' }),
+      warnBlock(found.warnings),
+    ];
+    showReport('Read from dataset', nodes, 'Add as new layers',
+      found.clips ? () => { applyImport(found); closeModal('report-modal'); } : null,
+      found.clips ? 'One new layer per style. Existing layers are left alone.' : 'Nothing found.');
+  } catch (err) {
+    U.fail(err, 'Reading from the dataset');
+  }
+}
+
+function applyImport(found) {
+  const p = state.project;
+  let added = 0;
+  for (const name of found.styles) {
+    const style = ensureStyle(name);
+    const clips = found.clips_by_style[name]
+      .map((c) => ({
+        id: U.uid('cl'),
+        start: c.start,
+        end: c.end,
+        text: U.asText(c.text),
+        source: { episode_index: c.episode_index, from: 'language_persistent' },
+      }))
+      .sort((a, b) => a.start - b.start);
+    p.layers.push({ id: U.uid('ly'), style_id: style.id, clips });
+    added += clips.length;
+  }
+  timeline.render();
+  renderStats();
+  markDirty();
+  U.toast(`Added ${added} segment(s) in ${found.styles.length} new layer(s)`);
+}
+
+/* ---------------- auto-annotate ---------------- */
+
+let autoPoll = null;
+
+/** Clips on `layerId` that overlap [start, end), as prompt context. */
+function annotationsOverlapping(layerId, start, end) {
+  const layer = (state.project.layers || []).find((l) => l.id === layerId);
+  if (!layer) return [];
+  return layer.clips
+    .filter((c) => c.end > start && c.start < end && (c.text || '').trim())
+    .map((c) => ({ start: c.start, end: c.end, text: c.text }));
+}
+
+function styleNameOf(layer) {
+  const style = (state.project.styles || []).find((s) => s.id === layer.style_id);
+  return style ? style.name : 'untitled';
+}
+
+function styleColorOf(layer) {
+  const style = (state.project.styles || []).find((s) => s.id === layer.style_id);
+  return style ? style.color : '#6EA8FF';
+}
+
+function openAutoAnnotate(sel) {
+  const start = Math.min(sel.start, sel.end);
+  const end = Math.max(sel.start, sel.end);
+  const project = state.project;
+  const body = $('auto-body');
+  body.innerHTML = '';
+
+  // Every view is sent by default: the backend takes any number of videos,
+  // and more angles is usually the better prompt.
+  const viewRows = Object.keys(project.timeline || {}).map((view) => {
+    const row = U.el('label', { class: 'view-row', 'data-view': view }, [
+      U.el('input', {
+        type: 'checkbox', checked: true, 'data-role': 'view',
+        onchange: (e) => row.classList.toggle('off', !e.target.checked),
+      }),
+      U.el('span', { text: view }),
+    ]);
+    return row;
+  });
+
+  // Everything is pre-checked except nothing: the layer the selection was
+  // drawn on is the obvious target, so it starts checked and the rest do not.
+  const rows = project.layers.map((layer, i) => {
+    const checked = layer.id === sel.layerId;
+    const row = U.el('div', { class: `layer-row${checked ? '' : ' off'}`, 'data-layer': layer.id }, [
+      U.el('input', {
+        type: 'checkbox', checked, 'data-role': 'pick',
+        onchange: (e) => row.classList.toggle('off', !e.target.checked),
+      }),
+      U.el('span', { class: 'name' }, [
+        U.el('span', { class: 'swatch', style: { background: styleColorOf(layer) } }),
+        U.el('span', { text: `${i + 1}. ${styleNameOf(layer)}` }),
+      ]),
+      U.el('input', {
+        type: 'text', 'data-role': 'instruction',
+        placeholder: 'instructions for this layer (optional)',
+      }),
+    ]);
+    return row;
+  });
+
+  const contextSelect = U.el('select', { id: 'auto-context' }, [
+    U.el('option', { value: '', text: 'none' }),
+    ...project.layers.map((layer, i) => U.el('option', {
+      value: layer.id, text: `${i + 1}. ${styleNameOf(layer)}`,
+    })),
+  ]);
+
+  body.append(
+    U.el('div', { class: 'figures' }, [
+      figure(U.dur(end - start), 'selection'),
+      figure(U.tc(start, false), 'from'),
+      figure(project.layers.length, 'layers'),
+    ]),
+    U.el('div', { class: 'field' }, [
+      U.el('label', { text: 'Camera views to send' }),
+      U.el('div', { class: 'view-pick' }, viewRows),
+    ]),
+    U.el('div', { class: 'field' }, [
+      U.el('label', { text: 'Layers to annotate' }),
+      U.el('div', { class: 'layer-pick' }, rows),
+    ]),
+    U.el('div', { class: 'field' }, [
+      U.el('label', { text: 'Use existing annotations from' }), contextSelect,
+    ]),
+    U.el('div', { class: 'field' }, [
+      U.el('label', { text: 'Extra notes for the prompt' }),
+      U.el('textarea', { id: 'auto-notes', rows: '2', placeholder: 'optional' }),
+    ]),
+  );
+
+  $('auto-progress').hidden = true;
+  $('auto-note').textContent = `${U.tc(start)} → ${U.tc(end)}`;
+  const run = $('auto-run');
+  run.hidden = false;
+  run.disabled = false;
+  run.textContent = 'Annotate';
+  run.onclick = () => startAutoAnnotate({ start, end, rows, viewRows, contextSelect });
+  openModal('auto-modal');
+}
+
+async function startAutoAnnotate({ start, end, rows, viewRows, contextSelect }) {
+  const layerIds = [];
+  const instructions = {};
+  for (const row of rows) {
+    if (!row.querySelector('[data-role="pick"]').checked) continue;
+    const id = row.dataset.layer;
+    layerIds.push(id);
+    const text = row.querySelector('[data-role="instruction"]').value.trim();
+    if (text) instructions[id] = text;
+  }
+  if (!layerIds.length) { U.toast('Pick at least one layer'); return; }
+
+  const views = viewRows
+    .filter((row) => row.querySelector('[data-role="view"]').checked)
+    .map((row) => row.dataset.view);
+  if (!views.length) { U.toast('Pick at least one camera view'); return; }
+
+  const contextLayerId = contextSelect.value || null;
+  const run = $('auto-run');
+  run.disabled = true;
+  run.textContent = 'Working…';
+  $('auto-progress').hidden = false;
+  setAutoProgress('Starting', 0.05, '');
+
+  try {
+    const job = await U.api('/api/auto-annotate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        root: state.root,
+        views,
+        start,
+        end,
+        layer_ids: layerIds,
+        layer_instructions: instructions,
+        context_layer_id: contextLayerId,
+        context_annotations: contextLayerId
+          ? annotationsOverlapping(contextLayerId, start, end) : [],
+        notes: ($('auto-notes').value || '').trim() || null,
+      }),
+    });
+    pollAutoAnnotate(job.id);
+  } catch (err) {
+    U.fail(err, 'Auto-annotate');
+    run.disabled = false;
+    run.textContent = 'Annotate';
+  }
+}
+
+function setAutoProgress(step, progress, note) {
+  $('auto-step').textContent = step;
+  const bar = $('auto-bar');
+  if (progress < 0) {
+    bar.classList.add('pending');      // the model call has nothing to measure
+    bar.style.width = '';
+  } else {
+    bar.classList.remove('pending');
+    bar.style.width = `${Math.round(progress * 100)}%`;
+  }
+  $('auto-log').textContent = note || '';
+}
+
+function pollAutoAnnotate(jobId) {
+  clearInterval(autoPoll);
+  autoPoll = setInterval(async () => {
+    let job;
+    try {
+      job = await U.api(`/api/auto-annotate/${jobId}`);
+    } catch (err) {
+      clearInterval(autoPoll);
+      U.fail(err, 'Auto-annotate');
+      return;
+    }
+    setAutoProgress(job.step, job.progress, (job.log || []).slice(-1)[0] || '');
+    if (job.state === 'done') {
+      clearInterval(autoPoll);
+      applyAutoAnnotations(job.result);
+    } else if (job.state === 'error') {
+      clearInterval(autoPoll);
+      setAutoProgress('Failed', 1, '');
+      U.toast(job.error, true);
+      const run = $('auto-run');
+      run.disabled = false;
+      run.textContent = 'Try again';
+    }
+  }, 500);
+}
+
+function applyAutoAnnotations(results) {
+  let made = 0;
+  for (const item of results) {
+    const layer = state.project.layers.find((l) => l.id === item.layer_id);
+    if (!layer) continue;
+    // Reuse createClip's neighbour trimming rather than shoving clips in raw.
+    timeline.setSelection({ layerId: layer.id, start: item.start, end: item.end });
+    if (timeline.createClip(U.asText(item.text))) made += 1;
+  }
+  timeline.setSelection(null);
+  refreshCreateButton();
+  closeModal('auto-modal');
+  timeline.render();
+  renderStats();
+  markDirty();
+  U.toast(made ? `Auto-annotated ${made} clip(s)` : 'Nothing could be placed (overlapping clips?)',
+    !made);
 }
 
 /* ---------------- open dialog ---------------- */
@@ -395,7 +792,7 @@ async function browse(path) {
     }
     $('browse-status').textContent = data.is_dataset ? 'LeRobot dataset' : `${data.entries.length} folders`;
   } catch (err) {
-    U.toast(err.message, true);
+    U.fail(err, 'Browsing');
   }
 }
 
@@ -444,18 +841,14 @@ function refreshCreateButton() {
   if (btn) btn.disabled = !timeline.selection;
 }
 
-function refreshAutoAnnotateSegment() {
-  console.log("refreshAutoAnnotateSegment");
-  const btn = document.querySelector('[data-action="auto-annotate-segment"]');
-  if (btn) btn.disabled = !timeline.selection;
-}
-
 const actions = {
   open: () => { openModal('open-modal'); browse(state.browsePath); },
   save: () => { saveSoon.flush(); },
   'export-json': () => exportAs('json'),
+  'export-csv': () => exportAs('csv'),
   'export-lerobot': () => exportToLeRobot(),
   'import-lerobot': () => importFromLeRobot(),
+  'auto-annotate': () => timeline.autoAnnotate(),
   reveal: () => U.toast(state.session ? state.session.project_path : 'Nothing open yet'),
   fit: () => timeline.fit(),
   'zoom-in': () => timeline.zoom(1.4),
@@ -464,7 +857,6 @@ const actions = {
   play: () => player.toggle(),
   'step-back': () => player.step(-1),
   'step-fwd': () => player.step(1),
-  'auto-annotate-segment': () => { timeline.autoAnnotateSegment(); refreshAutoAnnotateSegment(); },
   'mark-in': () => { timeline.mark('in'); refreshCreateButton(); },
   'mark-out': () => { timeline.mark('out'); refreshCreateButton(); },
   'create-clip': () => { timeline.createClip(); refreshCreateButton(); },
@@ -535,6 +927,7 @@ window.addEventListener('keydown', (e) => {
     case 'o': case 'O': actions['mark-out'](); break;
     // preventDefault matters: creating a clip focuses the text box, and
     // without this the 'c' keypress lands in it as the first character.
+    case 'a': case 'A': e.preventDefault(); timeline.autoAnnotate(); break;
     case 'c': case 'C': case 'Enter': e.preventDefault(); actions['create-clip'](); break;
     case 'Delete': case 'Backspace':
       if (timeline.selectedClipId) { e.preventDefault(); timeline.deleteClip(); }
@@ -551,182 +944,6 @@ window.addEventListener('keydown', (e) => {
       }
   }
 });
-
-/* ---------------- LeRobot write-back / import ---------------- */
- 
- 
-function ensureStyle(name) {
-  const p = state.project;
-  let style = p.styles.find((s) => s.name === name);
-  if (!style) {
-    style = { id: U.uid('st'), name, color: PALETTE[p.styles.length % PALETTE.length] };
-    p.styles.push(style);
-  }
-  return style;
-}
- 
-function figure(value, label) {
-  return U.el('div', { class: 'figure' }, [U.el('b', { text: String(value) }), U.el('span', { text: label })]);
-}
- 
-/** Generic preview + confirm. onConfirm null => informational only. */
-function showReport(title, nodes, confirmLabel, onConfirm, note = '') {
-  console.log("showReport", title, nodes, confirmLabel, onConfirm, note);
-  $('report-title').textContent = title;
-  console.log("showReport", title, nodes, confirmLabel, onConfirm, note);
-  const body = $('report-body');
-  body.innerHTML = '';
-  for (const n of nodes) if (n) body.appendChild(n);
-  $('report-note').textContent = note;
-  const btn = $('report-confirm');
-  btn.hidden = !onConfirm;
-  btn.textContent = confirmLabel || 'Confirm';
-  btn.onclick = onConfirm || null;
-  openModal('report-modal');
-}
- 
-function warnBlock(warnings) {
-  if (!warnings || !warnings.length) return null;
-  return U.el('div', {}, warnings.map((w) => U.el('div', { class: 'warn', text: w })));
-}
- 
-function exportPayload(extra) {
-  return JSON.stringify({
-    root: state.root, scope: state.scope, chunk: state.chunk, file: state.file, ...extra,
-  });
-}
- 
-async function exportToLeRobot() {
-  if (!state.root) { U.toast('Open a dataset first'); return; }
-  saveSoon.flush();
-  try {
-    const plan = await U.api('/api/export/lerobot', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: exportPayload({ dry_run: true }),
-    });
-    renderExportPlan(plan);
-  } catch (err) {
-    U.toast(err.message, true);
-  }
-}
- 
-function renderExportPlan(plan) {
-  const styleRows = Object.entries(plan.styles || {})
-    .map(([from, to]) => U.el('li', { class: 'mono', text: from === to ? from : `${from} → ${to}` }));
- 
-  const nodes = [
-    U.el('div', { class: 'figures' }, [
-      figure(plan.rows, 'rows to write'),
-      figure(`${plan.episodes_annotated}/${plan.episodes_total}`, 'episodes annotated'),
-      figure(plan.episodes_cleared, 'episodes cleared'),
-    ]),
-    U.el('h3', { text: 'Styles' }),
-    U.el('ul', {}, styleRows),
-    plan.skipped && plan.skipped.length
-      ? U.el('div', {}, [
-        U.el('h3', { text: `Skipped (${plan.skipped.length})` }),
-        U.el('ul', {}, plan.skipped.slice(0, 8).map((s) => U.el('li', { text: `${s.clip}: ${s.reason}` }))),
-      ])
-      : null,
-    warnBlock(plan.warnings),
-  ];
- 
-  const canWrite = plan.ok && plan.rows > 0;
-  showReport(
-    'Write into dataset',
-    nodes,
-    'Write to parquet',
-    canWrite ? () => applyExport() : null,
-    canWrite ? 'Rewrites data/*.parquet in place. A copy of data/ is saved first.' : 'Nothing to write.',
-  );
-}
- 
-async function applyExport() {
-  const btn = $('report-confirm');
-  btn.disabled = true;
-  btn.textContent = 'Writing…';
-  try {
-    const done = await U.api('/api/export/lerobot', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: exportPayload({ dry_run: false, backup: true, spans: true }),
-    });
-    showReport('Written', [
-      U.el('div', { class: 'figures' }, [
-        figure(done.rows, 'rows written'),
-        figure(done.episodes_annotated, 'episodes'),
-        figure((done.written || []).length, 'shards rewritten'),
-      ]),
-      U.el('h3', { text: 'Files' }),
-      U.el('ul', {}, (done.written || []).map((w) => U.el('li', { class: 'mono', text: w }))),
-      done.backup ? U.el('p', { class: 'mono muted', text: `backup: ${done.backup}` }) : null,
-      warnBlock(done.warnings),
-    ], null, null, done.validator || '');
-    U.toast(`Wrote ${done.rows} language_persistent row(s)`);
-  } catch (err) {
-    U.toast(err.message, true);
-    closeModal('report-modal');
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Write to parquet';
-  }
-}
- 
-async function importFromLeRobot() {
-  if (!state.root) { U.toast('Open a dataset first'); return; }
-  try {
-    const q = `root=${encodeURIComponent(state.root)}&scope=${state.scope}&chunk=${state.chunk}&file=${state.file}`;
-    const found = await U.api(`/api/import/lerobot?${q}`);
-    const nodes = [
-      U.el('div', { class: 'figures' }, [
-        figure(found.clips, 'segments'),
-        figure(found.styles.length, 'styles'),
-        figure(found.episodes, 'episodes'),
-      ]),
-      U.el('h3', { text: 'Styles found' }),
-      U.el('ul', {}, found.styles.map((s) => U.el('li', {
-        class: 'mono', text: `${s} — ${found.clips_by_style[s].length} segment(s)`,
-      }))),
-      found.exact_ends === found.clips && found.clips
-        ? U.el('p', { class: 'muted', text: 'Every segment carries an exact end_timestamp, so '
-          + 'starts and ends come back as they were written.' })
-        : U.el('div', { class: 'warn', text: 'Some rows have no end_timestamp. Those segments end '
-          + 'where the next annotation of the same style begins, or at the end of their episode.' }),
-      warnBlock(found.warnings),
-    ];
-    showReport('Read from dataset', nodes, 'Add as new layers',
-      found.clips ? () => { applyImport(found); closeModal('report-modal'); } : null,
-      found.clips ? 'One new layer per style. Existing layers are left alone.' : 'Nothing found.');
-  } catch (err) {
-    U.fail(err, 'Reading from the dataset');
-  }
-}
-
- 
-function applyImport(found) {
-  const p = state.project;
-  let added = 0;
-  for (const name of found.styles) {
-    const style = ensureStyle(name);
-    const clips = found.clips_by_style[name]
-      .map((c) => ({
-        id: U.uid('cl'),
-        start: c.start,
-        end: c.end,
-        text: c.text,
-        source: { episode_index: c.episode_index, from: 'language_persistent' },
-      }))
-      .sort((a, b) => a.start - b.start);
-    p.layers.push({ id: U.uid('ly'), style_id: style.id, clips });
-    added += clips.length;
-  }
-  timeline.render();
-  renderStats();
-  markDirty();
-  U.toast(`Added ${added} segment(s) in ${found.styles.length} new layer(s)`);
-}
- 
 
 /* ---------------- open dialog controls ---------------- */
 
@@ -768,6 +985,7 @@ window.timeline = timeline;
 window.state = state;
 
 (function boot() {
+  U.installErrorReporting();
   refreshCreateButton();
   const params = new URLSearchParams(location.search);
   const root = params.get('root');

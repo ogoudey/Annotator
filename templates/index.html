@@ -61,6 +61,7 @@
       <button class="btn icon" type="button" data-action="step-fwd" title="Forward one frame (→)">|&#9654;</button>
       <div class="timecode" id="timecode">00:00:00.000</div>
       <div class="timecode muted" id="duration">/ 00:00:00.000</div>
+      <button class="btn" type="button" data-action="auto-annotate" title="Auto-annotate the selection (A)">Auto&nbsp;&#9733;</button>
       <label class="rate">
         <select id="rate">
           <option value="0.25">0.25x</option>
@@ -71,7 +72,6 @@
           <option value="4">4x</option>
         </select>
       </label>
-      <button class="btn" type="button" data-action="auto-annotate-segment" title="Auto-annotate segment">Auto-annotate</button>
       <button class="btn" type="button" data-action="mark-in" title="Start selection at playhead (I)">Mark in</button>
       <button class="btn" type="button" data-action="mark-out" title="End selection at playhead (O)">Mark out</button>
       <button class="btn accent" type="button" data-action="create-clip" title="Create clip from selection (C)">Create clip</button>
@@ -153,6 +153,27 @@
       <li><kbd>+</kbd> / <kbd>-</kbd> / <kbd>F</kbd> Zoom in, out, fit</li>
       <li><kbd>S</kbd> Save now</li>
     </ul>
+  </div>
+</div>
+
+
+<!-- Auto-annotate dialog -->
+<div class="overlay" id="auto-modal" hidden>
+  <div class="dialog narrow wide-report">
+    <header><h2>Auto-annotate selection</h2><button class="btn icon close" type="button" data-close>&times;</button></header>
+    <div class="report-body" id="auto-body"></div>
+    <div class="progress" id="auto-progress" hidden>
+      <div class="progress-step" id="auto-step"></div>
+      <div class="progress-track"><div class="progress-bar" id="auto-bar"></div></div>
+      <div class="progress-log mono" id="auto-log"></div>
+    </div>
+    <footer>
+      <div class="muted" id="auto-note"></div>
+      <div class="row-actions">
+        <button class="btn" type="button" data-close>Cancel</button>
+        <button class="btn accent" type="button" id="auto-run">Annotate</button>
+      </div>
+    </footer>
   </div>
 </div>
 
